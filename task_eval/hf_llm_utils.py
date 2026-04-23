@@ -254,13 +254,17 @@ def get_hf_answers(in_data, out_data, args, pipeline, model_name):
             if qa['category'] == 2:
                 questions.append(qa['question'] + ' Use DATE of CONVERSATION to answer with an approximate date.')
             elif qa['category'] == 5:
+                # Some adversarial (category 5) items lack the 'answer' key in
+                # locomo10.json; fall back to the same 'no information' sentinel
+                # so the (a)/(b) prompt stays valid. Mirrors the gpt_utils fix.
+                gt_answer = qa.get('answer', 'No information available')
                 question = qa['question'] + " (a) {} (b) {}. Select the correct answer by writing (a) or (b)."
                 if random.random() < 0.5:
-                    question = question.format('No information available', qa['answer'])
-                    answer = {'a': 'No information available', 'b': qa['answer']}
+                    question = question.format('No information available', gt_answer)
+                    answer = {'a': 'No information available', 'b': gt_answer}
                 else:
-                    question = question.format(qa['answer'], 'No information available')
-                    answer = {'b': 'No information available', 'a': qa['answer']}
+                    question = question.format(gt_answer, 'No information available')
+                    answer = {'b': 'No information available', 'a': gt_answer}
                 cat_5_idxs.append(len(questions))
                 questions.append(question)
                 cat_5_answers.append(answer)
