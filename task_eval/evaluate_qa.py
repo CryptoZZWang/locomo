@@ -57,7 +57,7 @@ def main():
 
         gemini_model = genai.GenerativeModel(model_name)
     
-    elif any([model_name in args.model for model_name in ['gemma', 'llama', 'mistral']]):
+    elif any([model_name in args.model for model_name in ['gemma', 'llama', 'mistral', 'qwen']]):
         hf_pipeline, hf_model_name = init_hf_model(args)
 
     else:
@@ -90,7 +90,7 @@ def main():
             answers = get_claude_answers(data, out_data, prediction_key, args)
         elif 'gemini' in args.model:
             answers = get_gemini_answers(gemini_model, data, out_data, prediction_key, args)
-        elif any([model_name in args.model for model_name in ['gemma', 'llama', 'mistral']]):
+        elif any([model_name in args.model for model_name in ['gemma', 'llama', 'mistral', 'qwen']]):
             answers = get_hf_answers(data, out_data, args, hf_pipeline, hf_model_name)
         else:
             raise NotImplementedError
@@ -104,6 +104,10 @@ def main():
 
         out_samples[data['sample_id']] = answers
 
+        # Incremental checkpoint: persist after every sample so a crash/TPM
+        # failure does not discard earlier samples' predictions.
+        with open(args.out_file, 'w') as f:
+            json.dump(list(out_samples.values()), f, indent=2)
 
     with open(args.out_file, 'w') as f:
         json.dump(list(out_samples.values()), f, indent=2)

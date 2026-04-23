@@ -243,13 +243,17 @@ def get_gpt_answers(in_data, out_data, prediction_key, args):
             if qa['category'] == 2:
                 questions.append(qa['question'] + ' Use DATE of CONVERSATION to answer with an approximate date.')
             elif qa['category'] == 5:
+                # Some adversarial (category 5) items lack the 'answer' key in
+                # locomo10.json; fall back to the same 'not mentioned' string
+                # used for the distractor so the (a)/(b) prompt is still valid.
+                gt_answer = qa.get('answer', 'Not mentioned in the conversation')
                 question = qa['question'] + " Select the correct answer: (a) {} (b) {}. "
                 if random.random() < 0.5:
-                    question = question.format('Not mentioned in the conversation', qa['answer'])
-                    answer = {'a': 'Not mentioned in the conversation', 'b': qa['answer']}
+                    question = question.format('Not mentioned in the conversation', gt_answer)
+                    answer = {'a': 'Not mentioned in the conversation', 'b': gt_answer}
                 else:
-                    question = question.format(qa['answer'], 'Not mentioned in the conversation')
-                    answer = {'b': 'Not mentioned in the conversation', 'a': qa['answer']}
+                    question = question.format(gt_answer, 'Not mentioned in the conversation')
+                    answer = {'b': 'Not mentioned in the conversation', 'a': gt_answer}
 
                 cat_5_idxs.append(len(questions))
                 questions.append(question)

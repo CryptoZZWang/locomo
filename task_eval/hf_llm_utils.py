@@ -35,7 +35,9 @@ MAX_LENGTH={'llama2': 4096,
             'mistral-instruct-7b-32k-v2': 8000,
             'mistral-instruct-7b-8k-new': 8000,
             'mistral-instruct-7b-32k': 32000,
-            'mistral-instruct-7b-128k': 128000}
+            'mistral-instruct-7b-128k': 128000,
+            'qwen2.5-7b-instruct': 32000,
+            'llama-3.1-8b-instruct': 32000}
 
 
 QA_PROMPT = """
@@ -272,12 +274,16 @@ def get_hf_answers(in_data, out_data, args, pipeline, model_name):
 
         if args.batch_size == 1:
 
-            if 'mistral' in model_name:
+            if 'mistral' in model_name.lower():
                 answer = run_mistral(pipeline, questions[0], in_data, encoding, args)
-            elif 'llama' in model_name:
+            elif 'llama' in model_name.lower():
                 answer = run_llama(pipeline, questions[0], in_data, encoding, args)
-            elif 'gemma' in model_name:
+            elif 'gemma' in model_name.lower():
                 answer = run_gemma(pipeline, questions[0], in_data, encoding, args)
+            elif 'qwen' in model_name.lower():
+                # Qwen2.5 uses apply_chat_template too; reuse the Llama helper
+                # (system-prompt budgeting difference is negligible for smoke tests).
+                answer = run_llama(pipeline, questions[0], in_data, encoding, args)
             else:
                 raise NotImplementedError
             
@@ -336,6 +342,12 @@ def init_hf_model(args):
 
     elif 'mistral' in args.model.lower():
         model_name = 'mistralai/' + args.model
+
+    elif args.model == 'qwen2.5-7b-instruct':
+        model_name = 'Qwen/Qwen2.5-7B-Instruct'
+
+    elif args.model == 'llama-3.1-8b-instruct':
+        model_name = 'meta-llama/Llama-3.1-8B-Instruct'
 
     else:
         raise ValueError

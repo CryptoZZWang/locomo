@@ -196,10 +196,13 @@ def eval_question_answering(qas, eval_key='prediction', metric='f1'):
     answer_lengths = []
     for i, line in enumerate(qas):
         # line = json.loads(line)
+        # Category-5 adversarial items in locomo10.json can lack 'answer';
+        # default to the 'not mentioned' sentinel so scoring does not crash.
+        raw_answer = line.get('answer', 'No information available')
         if type(line[eval_key]) == list:
-            answer = line['answer']
+            answer = raw_answer
         else:
-            answer = str(line['answer'])
+            answer = str(raw_answer)
         if line['category'] == 3:
             answer = answer.split(';')[0].strip()
         
