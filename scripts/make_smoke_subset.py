@@ -13,7 +13,7 @@ SRC = REPO_ROOT / "data" / "locomo10.json"
 DST = REPO_ROOT / "data" / "locomo10_smoke.json"
 
 SAMPLE_ID = "conv-30"   # fewest QAs per locomo_sample_summary.csv
-NUM_QAS = 20
+NUM_QAS = None
 
 with open(SRC, "r", encoding="utf-8") as f:
     data = json.load(f)
