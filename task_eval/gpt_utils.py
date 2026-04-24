@@ -110,10 +110,46 @@ def prepare_for_rag(args, data):
 
 
     elif args.rag_mode == 'observation':
-        
-        # check if embeddings exist
-        assert os.path.exists(os.path.join(args.emb_dir, '%s_observation_%s.pkl' % (dataset_prefix, data['sample_id']))), "Observations and embeddings do not exist for %s" % data['sample_id']
-        database = pickle.load(open(os.path.join(args.emb_dir, '%s_observation_%s.pkl' % (dataset_prefix, data['sample_id'])), 'rb'))
+
+        # Auto-build observation embeddings from data['observation'] if the pkl
+        # is missing. Each observation is a [fact_text, dia_id] pair per speaker
+        # per session -- this is the Mem0-shaped structured memory ships with
+        # LoCoMo and was previously only usable via a separate generate script.
+        obs_pkl = os.path.join(args.emb_dir, '%s_observation_%s.pkl' % (dataset_prefix, data['sample_id']))
+        if not os.path.exists(obs_pkl):
+
+            observations = []
+            date_times = []
+            context_ids = []
+            obs_by_session = data.get('observation', {}) or {}
+            session_nums = [int(k.split('_')[1]) for k in obs_by_session.keys()
+                            if k.startswith('session_') and k.endswith('_observation')]
+            for i in sorted(set(session_nums)):
+                date_time = data['conversation'].get('session_%s_date_time' % i, '')
+                per_speaker = obs_by_session.get('session_%s_observation' % i, {}) or {}
+                for speaker, facts in per_speaker.items():
+                    if not isinstance(facts, list):
+                        continue
+                    for fact in facts:
+                        if isinstance(fact, (list, tuple)) and len(fact) >= 2:
+                            text, dia_id = fact[0], fact[1]
+                        else:
+                            text, dia_id = str(fact), ''
+                        observations.append('%s: %s' % (speaker, text))
+                        date_times.append(date_time)
+                        context_ids.append(dia_id)
+
+            print("Getting embeddings for %s observations" % len(observations))
+            embeddings = get_embeddings(args.retriever, observations, 'context')
+            assert embeddings.shape[0] == len(observations), "Lengths of embeddings and observations do not match"
+            database = {'embeddings': embeddings,
+                        'date_time': date_times,
+                        'dia_id': context_ids,
+                        'context': observations}
+            with open(obs_pkl, 'wb') as f:
+                pickle.dump(database, f)
+        else:
+            database = pickle.load(open(obs_pkl, 'rb'))
 
 
     else:
