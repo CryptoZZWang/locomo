@@ -177,43 +177,96 @@ def extract_facts_for_sample(data, pipeline, tokenizer, args):
     return out_records
 
 
-def dedupe_by_cosine(records, embeddings, threshold):
-    """Greedy dedup: drop a record whose max cosine similarity vs already-kept
-    embeddings exceeds threshold. Returns (kept_records, kept_embeddings)."""
+def _text_key(s):
+    return ' '.join(str(s).lower().split())
+
+
+def dedupe_records(records, embeddings, threshold, verbose=True):
+    """Two-stage dedupe:
+       (1) exact text dedupe (case-folded + whitespace-normalized fact text)
+       (2) centered-cosine greedy dedupe.
+
+    Centering (subtract the mean embedding) removes the first-PC anisotropy in
+    raw DRAGON CLS vectors, which otherwise makes unrelated facts score cosine
+    ~0.93-0.97 and collapses everything under a 0.92 threshold.
+    """
     if len(records) == 0:
-        return [], np.zeros((0, embeddings.shape[1] if embeddings.ndim == 2 else 0))
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8
-    normed = embeddings / norms
+        d = embeddings.shape[1] if embeddings.ndim == 2 else 0
+        return [], np.zeros((0, d))
+
+    # stage 1: exact text dedupe
+    seen = set()
+    idx_after_text = []
+    for i, r in enumerate(records):
+        k = _text_key(r['text'])
+        if k and k not in seen:
+            seen.add(k)
+            idx_after_text.append(i)
+    records1 = [records[i] for i in idx_after_text]
+    emb1 = embeddings[idx_after_text]
+    if verbose:
+        print('  stage-1 exact-text dedupe: %d -> %d' % (len(records), len(records1)))
+
+    if len(records1) <= 1:
+        return records1, emb1
+
+    # stage 2: centered cosine
+    mean = emb1.mean(axis=0, keepdims=True)
+    centered = emb1 - mean
+    norms = np.linalg.norm(centered, axis=1, keepdims=True) + 1e-8
+    normed = centered / norms
+
+    if verbose:
+        n = min(300, len(normed))
+        sim_mat = normed[:n] @ normed[:n].T
+        iu = np.triu_indices(n, k=1)
+        sims = sim_mat[iu]
+        qs = np.quantile(sims, [0.5, 0.9, 0.99, 0.995, 0.999]).round(3).tolist()
+        print('  centered-cos quantiles p50/p90/p99/p99.5/p99.9 (n=%d sample): %s' % (n, qs))
+
     keep_idx = []
-    for i in range(len(records)):
+    for i in range(len(records1)):
         if not keep_idx:
             keep_idx.append(i)
             continue
         sims = normed[keep_idx] @ normed[i]
         if float(sims.max()) < threshold:
             keep_idx.append(i)
-    kept = [records[i] for i in keep_idx]
-    kept_emb = embeddings[keep_idx]
+    kept = [records1[i] for i in keep_idx]
+    kept_emb = emb1[keep_idx]
+    if verbose:
+        print('  stage-2 centered-cos dedupe (threshold=%.3f): %d -> %d' % (threshold, len(records1), len(kept)))
     return kept, kept_emb
 
 
-def build_for_sample(data, pipeline, tokenizer, args, out_pkl):
-    print('Extracting memories for sample=%s' % data.get('sample_id'))
-    records = extract_facts_for_sample(data, pipeline, tokenizer, args)
-    print('  extracted %d raw facts' % len(records))
-    if len(records) == 0:
-        print('  WARNING: no facts extracted; writing empty pkl')
-        database = {'embeddings': np.zeros((0, 768)), 'date_time': [], 'dia_id': [], 'context': []}
-        with open(out_pkl, 'wb') as f:
-            pickle.dump(database, f)
-        return
+def build_for_sample(data, pipeline, tokenizer, args, out_pkl, raw_pkl):
+    if args.from_raw and os.path.exists(raw_pkl):
+        print('Loading raw extractions from %s' % raw_pkl)
+        raw = pickle.load(open(raw_pkl, 'rb'))
+        records = raw['records']
+        embeddings = raw['embeddings']
+        print('  loaded %d raw facts' % len(records))
+    else:
+        print('Extracting memories for sample=%s' % data.get('sample_id'))
+        records = extract_facts_for_sample(data, pipeline, tokenizer, args)
+        print('  extracted %d raw facts' % len(records))
+        if len(records) == 0:
+            print('  WARNING: no facts extracted; writing empty pkl')
+            database = {'embeddings': np.zeros((0, 768)), 'date_time': [], 'dia_id': [], 'context': []}
+            with open(out_pkl, 'wb') as f:
+                pickle.dump(database, f)
+            return
 
-    texts = [r['text'] for r in records]
-    embeddings = get_embeddings(args.retriever, texts, 'context')
-    assert embeddings.shape[0] == len(records)
+        texts = [r['text'] for r in records]
+        embeddings = get_embeddings(args.retriever, texts, 'context')
+        assert embeddings.shape[0] == len(records)
 
-    kept, kept_emb = dedupe_by_cosine(records, embeddings, args.dedupe_threshold)
-    print('  kept %d facts after dedupe (threshold=%.2f)' % (len(kept), args.dedupe_threshold))
+        os.makedirs(os.path.dirname(raw_pkl) or '.', exist_ok=True)
+        with open(raw_pkl, 'wb') as f:
+            pickle.dump({'records': records, 'embeddings': embeddings}, f)
+        print('  wrote raw cache to %s' % raw_pkl)
+
+    kept, kept_emb = dedupe_records(records, embeddings, args.dedupe_threshold)
 
     database = {
         'embeddings': kept_emb,
@@ -241,6 +294,8 @@ def parse_args():
     ap.add_argument('--dedupe-threshold', type=float, default=0.92,
                     help='Drop a fact if cosine similarity to any kept fact exceeds this')
     ap.add_argument('--overwrite', action='store_true')
+    ap.add_argument('--from-raw', action='store_true',
+                    help='Skip LLM extraction; reuse {prefix}_mem0_raw_{sample}.pkl and only redo dedupe.')
     return ap.parse_args()
 
 
@@ -256,16 +311,19 @@ def main():
     os.makedirs(args.emb_dir, exist_ok=True)
     dataset_prefix = os.path.splitext(os.path.basename(args.data_file))[0]
 
-    init_ns = Namespace(model=args.model, use_4bit=args.use_4bit)
-    pipeline, _model_name = init_hf_model(init_ns)
-    tokenizer = pipeline.tokenizer
+    pipeline, tokenizer = None, None
+    if not args.from_raw:
+        init_ns = Namespace(model=args.model, use_4bit=args.use_4bit)
+        pipeline, _model_name = init_hf_model(init_ns)
+        tokenizer = pipeline.tokenizer
 
     for data in samples:
         out_pkl = os.path.join(args.emb_dir, '%s_mem0_%s.pkl' % (dataset_prefix, data['sample_id']))
-        if os.path.exists(out_pkl) and not args.overwrite:
-            print('skip existing %s (use --overwrite to rebuild)' % out_pkl)
+        raw_pkl = os.path.join(args.emb_dir, '%s_mem0_raw_%s.pkl' % (dataset_prefix, data['sample_id']))
+        if os.path.exists(out_pkl) and not args.overwrite and not args.from_raw:
+            print('skip existing %s (use --overwrite to rebuild, or --from-raw to re-dedupe)' % out_pkl)
             continue
-        build_for_sample(data, pipeline, tokenizer, args, out_pkl)
+        build_for_sample(data, pipeline, tokenizer, args, out_pkl, raw_pkl)
 
     print('done.')
 
