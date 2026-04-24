@@ -109,6 +109,21 @@ def prepare_for_rag(args, data):
             database = pickle.load(open(os.path.join(args.emb_dir, '%s_dialog_%s.pkl' % (dataset_prefix, data['sample_id'])), 'rb'))
 
 
+    elif args.rag_mode == 'mem0':
+
+        # Mem0-lite: LLM-extracted + deduped memories built offline by
+        # scripts/build_mem0_memories.py. Same pkl schema as dialog/observation.
+        mem0_pkl = os.path.join(args.emb_dir, '%s_mem0_%s.pkl' % (dataset_prefix, data['sample_id']))
+        if not os.path.exists(mem0_pkl):
+            raise FileNotFoundError(
+                "Mem0 memories pkl not found: %s\n"
+                "Build it first with: python scripts/build_mem0_memories.py "
+                "--data-file %s --sample-id %s --model qwen2.5-7b-instruct --use-4bit"
+                % (mem0_pkl, args.data_file, data['sample_id'])
+            )
+        database = pickle.load(open(mem0_pkl, 'rb'))
+
+
     elif args.rag_mode == 'observation':
 
         # Auto-build observation embeddings from data['observation'] if the pkl
@@ -197,7 +212,7 @@ def get_rag_context(context_database, query_vector, args):
 
     # sorted_context_ids = [context_database['dia_id'][idx] for idx in sorted_outputs[:args.top_k]]
     sorted_date_times = [context_database['date_time'][idx] for idx in sorted_outputs[:args.top_k]]
-    if args.rag_mode in ['dialog', 'observation']:
+    if args.rag_mode in ['dialog', 'observation', 'mem0']:
         query_context = '\n'.join([date_time + ': ' + context for date_time, context in zip(sorted_date_times, sorted_context)])
     else:
         query_context = '\n\n'.join([date_time + ': ' + context for date_time, context in zip(sorted_date_times, sorted_context)])
