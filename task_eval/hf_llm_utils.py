@@ -224,12 +224,49 @@ def get_input_context(data, question_prompt, encoding, args):
     return query_conv
 
 
+def run_hf_rag(pipeline, question, rag_context, tokenizer, args):
+    """Minimal RAG generation path for HF models.
+
+    Skips the long-context ``get_input_context`` truncation and instead feeds
+    the retrieved snippets (``rag_context``) directly into the chat template.
+    """
+    question_prompt = QA_PROMPT.format(question)
+    query = tokenizer.apply_chat_template(
+        [{"role": "user", "content": rag_context + '\n\n' + question_prompt}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    sequences = pipeline(
+        query,
+        max_new_tokens=args.batch_size * ANS_TOKENS_PER_QUES,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        do_sample=True,
+        top_k=10,
+        temperature=0.4,
+        top_p=0.9,
+        return_full_text=False,
+        num_return_sequences=1,
+    )
+    return sequences[0]['generated_text']
+
+
 def get_hf_answers(in_data, out_data, args, pipeline, model_name):
 
     if 'mistral' in model_name:
         encoding = AutoTokenizer.from_pretrained(model_name)
     else:
         encoding = AutoTokenizer.from_pretrained(model_name)
+
+    # Match the prediction_key convention used in evaluate_qa.py so RAG runs
+    # do not collide with full-context runs in the same output JSON.
+    if args.use_rag:
+        prediction_key = "%s_%s_top_%s_prediction" % (args.model, args.rag_mode, args.top_k)
+        from task_eval.gpt_utils import prepare_for_rag, get_rag_context
+        context_database, query_vectors = prepare_for_rag(args, in_data)
+    else:
+        prediction_key = "%s_prediction" % args.model
+        context_database, query_vectors = None, None
 
     for batch_start_idx in range(0, len(in_data['qa']) + args.batch_size, args.batch_size):
 
@@ -243,8 +280,8 @@ def get_hf_answers(in_data, out_data, args, pipeline, model_name):
             if i>=len(in_data['qa']):
                 break
             qa = in_data['qa'][i]
-            # skip if already predicted and overwrite is set to False            
-            if '%s_prediction' % args.model not in qa or args.overwrite:
+            # skip if already predicted and overwrite is set to False
+            if prediction_key not in qa or args.overwrite:
                 include_idxs.append(i)
             else:
                 print("Skipping -->", qa['question'])
@@ -278,7 +315,12 @@ def get_hf_answers(in_data, out_data, args, pipeline, model_name):
 
         if args.batch_size == 1:
 
-            if 'mistral' in model_name.lower():
+            if args.use_rag:
+                query_conv, context_ids = get_rag_context(
+                    context_database, query_vectors[include_idxs][0], args
+                )
+                answer = run_hf_rag(pipeline, questions[0], query_conv, encoding, args)
+            elif 'mistral' in model_name.lower():
                 answer = run_mistral(pipeline, questions[0], in_data, encoding, args)
             elif 'llama' in model_name.lower():
                 answer = run_llama(pipeline, questions[0], in_data, encoding, args)
@@ -304,7 +346,9 @@ def get_hf_answers(in_data, out_data, args, pipeline, model_name):
                     answer = cat_5_answers[0]['b']
             else:
                 answer = answer.lower().replace('(a)', '').replace('(b)', '').replace('a)', '').replace('b)', '').replace('answer:', '').strip()
-            out_data['qa'][batch_start_idx]['%s_prediction' % args.model] = answer
+            out_data['qa'][batch_start_idx][prediction_key] = answer
+            if args.use_rag:
+                out_data['qa'][batch_start_idx][prediction_key + '_context'] = context_ids
 
         else:            
             raise NotImplementedError
