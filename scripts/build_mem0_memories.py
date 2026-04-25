@@ -64,6 +64,28 @@ EXTRACTION_USER = (
 )
 
 
+CONSOLIDATE_SYSTEM = (
+    "You are a memory manager for an AI assistant. For each new candidate "
+    "fact about a person, you decide how it should be integrated relative "
+    "to the most similar existing memories already in the store. Be precise "
+    "and conservative."
+)
+
+CONSOLIDATE_USER = (
+    "Existing memories (most similar to the candidate, indexed):\n{neighbors}\n\n"
+    "Candidate fact:\n{candidate}\n\n"
+    "Choose ONE operation:\n"
+    "- ADD:    candidate is new information, not redundant with any existing memory\n"
+    "- NOOP:   candidate is already represented by one of the existing memories\n"
+    "- UPDATE: candidate refines or augments an existing memory; replace it with one richer fact\n"
+    "- DELETE: candidate contradicts an existing memory; the old memory is now incorrect\n\n"
+    "Return ONLY a JSON object with these keys:\n"
+    "- \"action\":       one of \"ADD\", \"NOOP\", \"UPDATE\", \"DELETE\"\n"
+    "- \"target_index\": integer index of the affected existing memory (only for UPDATE / DELETE)\n"
+    "- \"merged_fact\":  one short sentence merging candidate with the target memory (only for UPDATE)"
+)
+
+
 def parse_json_list(text):
     """Best-effort JSON list extraction from LLM output."""
     i = text.find('[')
@@ -84,6 +106,19 @@ def parse_json_list(text):
             if fact:
                 clean.append({'speaker': speaker, 'fact': fact})
     return clean
+
+
+def parse_json_obj(text):
+    """Best-effort JSON object extraction from LLM output."""
+    i = text.find('{')
+    j = text.rfind('}')
+    if i == -1 or j == -1 or j < i:
+        return {}
+    try:
+        out = json.loads(text[i:j + 1])
+        return out if isinstance(out, dict) else {}
+    except Exception:
+        return {}
 
 
 def turn_str(turn):
@@ -239,6 +274,126 @@ def dedupe_records(records, embeddings, threshold, verbose=True):
     return kept, kept_emb
 
 
+def _qwen_decide(candidate_text, neighbor_texts, pipeline, tokenizer):
+    neighbors_block = '\n'.join('[%d] %s' % (i, t) for i, t in enumerate(neighbor_texts))
+    messages = [
+        {'role': 'system', 'content': CONSOLIDATE_SYSTEM},
+        {'role': 'user',   'content': CONSOLIDATE_USER.format(
+            neighbors=neighbors_block, candidate=candidate_text)},
+    ]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    try:
+        gen = pipeline(
+            prompt,
+            max_new_tokens=128,
+            do_sample=False,
+            return_full_text=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        return parse_json_obj(gen[0]['generated_text'])
+    except Exception:
+        return {}
+
+
+def llm_consolidate_records(records, embeddings, pipeline, tokenizer, args, verbose=True):
+    """Mem0 Algorithm 1 (Appendix B), streaming variant.
+
+    For each candidate (in original chronological order):
+      - find top-s most similar already-kept memories using centered cosine
+      - if max similarity < auto_add_threshold -> auto-ADD (no LLM call)
+      - else ask Qwen for one of {ADD, NOOP, UPDATE, DELETE} + target_index + merged_fact
+    """
+    if len(records) <= 1:
+        return list(records), np.array(embeddings)
+
+    mean = embeddings.mean(axis=0)
+
+    def center_norm(e):
+        c = e - mean
+        n = float(np.linalg.norm(c)) + 1e-8
+        return c / n
+
+    kept_records = [records[0]]
+    kept_emb = [embeddings[0]]
+    kept_normed = [center_norm(embeddings[0])]
+
+    counts = {'auto_add': 1, 'add': 0, 'noop': 0, 'update': 0, 'delete': 0, 'llm_calls': 0}
+
+    for i in tqdm(range(1, len(records)), desc='consolidate', leave=False):
+        cand = records[i]
+        cand_emb = embeddings[i]
+        cand_normed = center_norm(cand_emb)
+
+        sims = np.array(kept_normed) @ cand_normed
+        max_sim = float(sims.max())
+
+        if max_sim < args.consolidate_add_threshold:
+            kept_records.append(cand)
+            kept_emb.append(cand_emb)
+            kept_normed.append(cand_normed)
+            counts['auto_add'] += 1
+            continue
+
+        s = min(args.consolidate_top_s, len(kept_records))
+        if s < len(sims):
+            top_idx = np.argpartition(-sims, s - 1)[:s]
+            top_idx = top_idx[np.argsort(-sims[top_idx])]
+        else:
+            top_idx = np.argsort(-sims)
+        neighbor_texts = [kept_records[int(j)]['text'] for j in top_idx]
+
+        op = _qwen_decide(cand['text'], neighbor_texts, pipeline, tokenizer)
+        counts['llm_calls'] += 1
+        action = str(op.get('action', 'ADD')).strip().upper()
+        target = op.get('target_index')
+        try:
+            target = int(target) if target is not None else None
+        except (TypeError, ValueError):
+            target = None
+        target_ok = target is not None and 0 <= target < len(neighbor_texts)
+
+        if action == 'NOOP':
+            counts['noop'] += 1
+            continue
+
+        if action == 'UPDATE' and target_ok:
+            g = int(top_idx[target])
+            merged = str(op.get('merged_fact') or cand['text']).strip()
+            new_emb = (kept_emb[g] + cand_emb) / 2.0
+            kept_records[g] = {
+                'text':      merged,
+                'dia_id':    '%s;%s' % (kept_records[g]['dia_id'], cand['dia_id']),
+                'date_time': cand['date_time'],
+            }
+            kept_emb[g] = new_emb
+            kept_normed[g] = center_norm(new_emb)
+            counts['update'] += 1
+            continue
+
+        if action == 'DELETE' and target_ok:
+            g = int(top_idx[target])
+            del kept_records[g]
+            del kept_emb[g]
+            del kept_normed[g]
+            kept_records.append(cand)
+            kept_emb.append(cand_emb)
+            kept_normed.append(cand_normed)
+            counts['delete'] += 1
+            continue
+
+        kept_records.append(cand)
+        kept_emb.append(cand_emb)
+        kept_normed.append(cand_normed)
+        counts['add'] += 1
+
+    if verbose:
+        print('  llm-consolidate: auto_add=%(auto_add)d add=%(add)d noop=%(noop)d '
+              'update=%(update)d delete=%(delete)d llm_calls=%(llm_calls)d' % counts)
+        print('  kept %d facts' % len(kept_records))
+
+    return kept_records, np.stack(kept_emb)
+
+
 def build_for_sample(data, pipeline, tokenizer, args, out_pkl, raw_pkl):
     if args.from_raw and os.path.exists(raw_pkl):
         print('Loading raw extractions from %s' % raw_pkl)
@@ -266,7 +421,20 @@ def build_for_sample(data, pipeline, tokenizer, args, out_pkl, raw_pkl):
             pickle.dump({'records': records, 'embeddings': embeddings}, f)
         print('  wrote raw cache to %s' % raw_pkl)
 
-    kept, kept_emb = dedupe_records(records, embeddings, args.dedupe_threshold)
+    if args.llm_consolidate:
+        seen = set()
+        idx_after_text = []
+        for i, r in enumerate(records):
+            k = _text_key(r['text'])
+            if k and k not in seen:
+                seen.add(k)
+                idx_after_text.append(i)
+        records = [records[i] for i in idx_after_text]
+        embeddings = embeddings[idx_after_text]
+        print('  stage-1 exact-text dedupe: %d records' % len(records))
+        kept, kept_emb = llm_consolidate_records(records, embeddings, pipeline, tokenizer, args)
+    else:
+        kept, kept_emb = dedupe_records(records, embeddings, args.dedupe_threshold)
 
     database = {
         'embeddings': kept_emb,
@@ -296,6 +464,12 @@ def parse_args():
     ap.add_argument('--overwrite', action='store_true')
     ap.add_argument('--from-raw', action='store_true',
                     help='Skip LLM extraction; reuse {prefix}_mem0_raw_{sample}.pkl and only redo dedupe.')
+    ap.add_argument('--llm-consolidate', action='store_true',
+                    help='Use Mem0-style LLM ADD/UPDATE/DELETE/NOOP consolidation instead of cosine dedupe.')
+    ap.add_argument('--consolidate-top-s', type=int, default=5,
+                    help='Number of nearest existing memories to show the LLM per candidate.')
+    ap.add_argument('--consolidate-add-threshold', type=float, default=0.3,
+                    help='If max centered cosine to existing memories < this, auto-ADD without calling the LLM.')
     return ap.parse_args()
 
 
@@ -312,7 +486,8 @@ def main():
     dataset_prefix = os.path.splitext(os.path.basename(args.data_file))[0]
 
     pipeline, tokenizer = None, None
-    if not args.from_raw:
+    need_model = (not args.from_raw) or args.llm_consolidate
+    if need_model:
         init_ns = Namespace(model=args.model, use_4bit=args.use_4bit)
         pipeline, _model_name = init_hf_model(init_ns)
         tokenizer = pipeline.tokenizer
