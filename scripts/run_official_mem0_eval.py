@@ -19,14 +19,15 @@ Pipeline:
   6. Score with eval_question_answering + analyze_aggr_acc and write stats next
      to the predictions file.
 
-Run on Colab (after `pip install mem0ai google-generativeai`):
+Run on Colab (after `pip install mem0ai google-generativeai sentence-transformers`):
 
     export GEMINI_API_KEY=...
     python scripts/run_official_mem0_eval.py \
         --data-file data/locomo10_smoke.json \
         --sample-id conv-30 \
         --out-file outputs/conv30_official_mem0_qa.json \
-        --top-k 10
+        --top-k 10 \
+        --max-qa 5 --qa-sleep 10
 """
 
 import sys
@@ -74,9 +75,28 @@ def get_session_nums(conv):
     return sorted(set(nums))
 
 
-def build_memory(api_key, llm_model, embed_model, collection):
-    """Construct an official mem0.Memory backed by Gemini + qdrant in-memory."""
+def build_memory(api_key, llm_model, embed_provider, embed_model, embed_dims, collection):
+    """Construct an official mem0.Memory:
+       - LLM: Gemini (configurable model)
+       - Embedder: huggingface (default; no API, avoids Gemini embedContent 404)
+                   OR gemini (only if explicitly chosen)
+       - Vector store: qdrant in-memory
+    """
     from mem0 import Memory
+
+    if embed_provider == 'huggingface':
+        embedder_cfg = {
+            "provider": "huggingface",
+            "config": {"model": embed_model},
+        }
+    elif embed_provider == 'gemini':
+        embedder_cfg = {
+            "provider": "gemini",
+            "config": {"model": embed_model, "api_key": api_key},
+        }
+    else:
+        raise ValueError('Unsupported --embed-provider: %s' % embed_provider)
+
     config = {
         "llm": {
             "provider": "gemini",
@@ -87,18 +107,12 @@ def build_memory(api_key, llm_model, embed_model, collection):
                 "max_tokens": 2000,
             },
         },
-        "embedder": {
-            "provider": "gemini",
-            "config": {
-                "model": embed_model,
-                "api_key": api_key,
-            },
-        },
+        "embedder": embedder_cfg,
         "vector_store": {
             "provider": "qdrant",
             "config": {
                 "collection_name": collection,
-                "embedding_model_dims": 768,
+                "embedding_model_dims": embed_dims,
                 "on_disk": False,
             },
         },
@@ -201,8 +215,15 @@ def parse_args():
     ap.add_argument('--sample-id', default='conv-30')
     ap.add_argument('--out-file',  default='outputs/conv30_official_mem0_qa.json')
     ap.add_argument('--top-k', type=int, default=10)
-    ap.add_argument('--llm-model', default='gemini-2.0-flash')
-    ap.add_argument('--embed-model', default='models/text-embedding-004')
+    ap.add_argument('--llm-model', default='gemini-1.5-flash',
+                    help='gemini-1.5-flash has higher free-tier quota than 2.0-flash.')
+    ap.add_argument('--embed-provider', default='huggingface',
+                    choices=['huggingface', 'gemini'],
+                    help='Local sentence-transformers by default; avoids Gemini embedContent issues.')
+    ap.add_argument('--embed-model', default='sentence-transformers/all-MiniLM-L6-v2',
+                    help='HF default is 384-dim MiniLM. If you switch model, also set --embed-dims.')
+    ap.add_argument('--embed-dims', type=int, default=384,
+                    help='Must match the embedder output dimension (MiniLM=384, mpnet=768).')
     ap.add_argument('--collection', default='locomo_official_mem0')
     ap.add_argument('--skip-ingest', action='store_true',
                     help='Reuse an existing Mem0 collection if it persists; otherwise ingest.')
@@ -226,12 +247,31 @@ def main():
     if sample is None:
         raise SystemExit('sample_id=%s not found in %s' % (args.sample_id, args.data_file))
 
-    print('initializing mem0...')
-    m = build_memory(api_key, args.llm_model, args.embed_model, args.collection)
+    print('initializing mem0 (llm=%s, embed=%s/%s dims=%d)...' %
+          (args.llm_model, args.embed_provider, args.embed_model, args.embed_dims))
+    m = build_memory(api_key, args.llm_model, args.embed_provider,
+                     args.embed_model, args.embed_dims, args.collection)
 
     if not args.skip_ingest:
         print('ingesting sample=%s into Mem0...' % args.sample_id)
         ingest_sample(m, sample, user_id=args.sample_id, sleep_per_session=args.ingest_sleep)
+
+    print('preflight: probing mem0 with a generic query...')
+    try:
+        probe_hits = search_memories(m, 'what topics did the speakers discuss?',
+                                     args.sample_id, args.top_k)
+    except Exception as e:
+        probe_hits = []
+        print('  preflight search raised: %s' % e)
+    print('  preflight retrieved %d memories' % len(probe_hits))
+    if probe_hits:
+        print('  first 3 memories:')
+        for s in probe_hits[:3]:
+            print('   - %s' % str(s)[:160])
+    else:
+        print('  WARNING: preflight returned 0 memories. Ingest likely failed; '
+              'QA generation will produce empty contexts. Consider re-running '
+              'ingest with longer --ingest-sleep or check mem0/embedder errors above.')
 
     qas = sample['qa']
     if args.max_qa is not None:
