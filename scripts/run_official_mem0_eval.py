@@ -135,11 +135,15 @@ def ingest_sample(m, sample, user_id, sleep_per_session=2.0):
 
 
 def search_memories(m, query, user_id, k):
-    """Mem0's search() return shape varies between releases."""
+    """Mem0's search() API: newer releases require filters={'user_id': ...}.
+    Falls back to the older user_id= kwarg for older releases."""
     try:
-        res = m.search(query=query, user_id=user_id, limit=k)
+        res = m.search(query=query, filters={"user_id": user_id}, limit=k)
     except TypeError:
-        res = m.search(query, user_id=user_id, limit=k)
+        try:
+            res = m.search(query=query, user_id=user_id, limit=k)
+        except TypeError:
+            res = m.search(query, user_id=user_id, limit=k)
     if isinstance(res, dict):
         hits = res.get('results', []) or []
     elif isinstance(res, list):
@@ -155,12 +159,23 @@ def search_memories(m, query, user_id, k):
     return out
 
 
-def gemini_generate(api_key, model_name, prompt, max_output_tokens=80, retries=2):
+_QUOTA_TOKENS = ('429', 'quota', 'resource_exhausted', 'rate limit', 'rate_limit')
+
+
+def _is_quota_error(e):
+    s = ('%s %s' % (type(e).__name__, e)).lower()
+    return any(t in s for t in _QUOTA_TOKENS)
+
+
+def gemini_generate(api_key, model_name, prompt, max_output_tokens=80, max_retries=6):
+    """Robust Gemini call with exponential backoff on 429 / quota errors."""
     import google.generativeai as genai
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
+    quota_delays = [15, 30, 60, 90, 120, 180]
+    other_delays = [2, 4, 8, 16, 32, 64]
     last_err = None
-    for attempt in range(retries + 1):
+    for attempt in range(max_retries):
         try:
             resp = model.generate_content(
                 prompt,
@@ -172,7 +187,11 @@ def gemini_generate(api_key, model_name, prompt, max_output_tokens=80, retries=2
             return (resp.text or '').strip()
         except Exception as e:
             last_err = e
-            time.sleep(2 ** attempt)
+            quota = _is_quota_error(e)
+            wait = (quota_delays if quota else other_delays)[min(attempt, 5)]
+            print('  gemini retry %d/%d in %ds (%s: %s)' %
+                  (attempt + 1, max_retries, wait, type(e).__name__, str(e)[:120]))
+            time.sleep(wait)
     raise last_err
 
 
@@ -189,6 +208,10 @@ def parse_args():
                     help='Reuse an existing Mem0 collection if it persists; otherwise ingest.')
     ap.add_argument('--ingest-sleep', type=float, default=2.0,
                     help='Seconds to sleep between sessions to stay under Gemini RPM.')
+    ap.add_argument('--qa-sleep', type=float, default=10.0,
+                    help='Seconds to sleep between QAs to stay under Gemini RPM.')
+    ap.add_argument('--max-qa', type=int, default=None,
+                    help='Process only the first N QAs (smoke / debug). None = all.')
     return ap.parse_args()
 
 
@@ -210,42 +233,79 @@ def main():
         print('ingesting sample=%s into Mem0...' % args.sample_id)
         ingest_sample(m, sample, user_id=args.sample_id, sleep_per_session=args.ingest_sleep)
 
-    print('generating answers for %d QAs...' % len(sample['qa']))
+    qas = sample['qa']
+    if args.max_qa is not None:
+        qas = qas[:args.max_qa]
+    print('generating answers for %d / %d QAs (qa-sleep=%.1fs)...' %
+          (len(qas), len(sample['qa']), args.qa_sleep))
+
     qa_out = []
     os.makedirs(os.path.dirname(args.out_file) or '.', exist_ok=True)
 
-    for i, qa in enumerate(tqdm(sample['qa'], desc='qa')):
+    for i, qa in enumerate(tqdm(qas, desc='qa')):
         question = qa['question']
+        rec = dict(qa)
+        status = 'ok'
+
         try:
             mems = search_memories(m, question, args.sample_id, args.top_k)
         except Exception as e:
             print('  search error qa[%d]: %s' % (i, e))
             mems = []
-        mem_text = '\n'.join('- %s' % t for t in mems) if mems else '(no memories retrieved)'
+            status = 'search_error'
 
+        if status == 'ok' and not mems:
+            status = 'search_empty'
+
+        mem_text = '\n'.join('- %s' % t for t in mems) if mems else '(no memories retrieved)'
         prompt = ANSWER_PROMPT.format(memories=mem_text, question=question)
+
         try:
             answer = gemini_generate(api_key, args.llm_model, prompt)
         except Exception as e:
             print('  generate error qa[%d]: %s' % (i, e))
             answer = ''
+            status = 'generate_error' if status == 'ok' else status + '+generate_error'
 
-        rec = dict(qa)
+        if status in ('ok', 'search_empty') and not answer:
+            status = 'generate_empty' if status == 'ok' else status + '+generate_empty'
+
         rec[PREDICTION_KEY] = answer
         rec[PREDICTION_KEY + '_context'] = mems
+        rec[PREDICTION_KEY + '_status'] = status
         qa_out.append(rec)
 
-        # incremental save every 10 QAs (cheap insurance)
-        if (i + 1) % 10 == 0:
+        if (i + 1) % 5 == 0:
             with open(args.out_file, 'w') as f:
                 json.dump([{'sample_id': args.sample_id, 'qa': qa_out}], f, indent=2)
+
+        if args.qa_sleep and i < len(qas) - 1:
+            time.sleep(args.qa_sleep)
 
     out = [{'sample_id': args.sample_id, 'qa': qa_out}]
     with open(args.out_file, 'w') as f:
         json.dump(out, f, indent=2)
     print('wrote %s' % args.out_file)
 
-    # score with the repo's own evaluator
+    n_total = len(qa_out)
+    n_ok = sum(1 for r in qa_out if r.get(PREDICTION_KEY + '_status') == 'ok')
+    n_ctx = sum(1 for r in qa_out if r.get(PREDICTION_KEY + '_context'))
+    n_pred = sum(1 for r in qa_out if str(r.get(PREDICTION_KEY) or '').strip())
+    n_failed = n_total - n_ok
+    print('=' * 60)
+    print('SUMMARY')
+    print('  total QAs requested      : %d' % n_total)
+    print('  successful predictions   : %d  (status==ok)' % n_ok)
+    print('  nonempty contexts        : %d' % n_ctx)
+    print('  nonempty predictions     : %d' % n_pred)
+    print('  failed QAs               : %d' % n_failed)
+    print('=' * 60)
+
+    if n_ok == 0:
+        print('NOT scoring: 0 successful predictions. Inspect %s for per-QA *_status fields.'
+              % args.out_file)
+        return
+
     print('scoring...')
     from task_eval.evaluation import eval_question_answering
     from task_eval.evaluation_stats import analyze_aggr_acc
