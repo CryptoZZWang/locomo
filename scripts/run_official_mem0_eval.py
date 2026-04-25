@@ -19,15 +19,23 @@ Pipeline:
   6. Score with eval_question_answering + analyze_aggr_acc and write stats next
      to the predictions file.
 
-Run on Colab (after `pip install mem0ai google-generativeai sentence-transformers`):
+Run on Colab (after `pip install mem0ai google-generativeai groq sentence-transformers`):
 
+    # Recommended: Groq (free tier, 30 RPM / 1000 RPD)
+    export GROQ_API_KEY=...
+    python scripts/run_official_mem0_eval.py \
+        --llm-provider groq --llm-model llama-3.3-70b-versatile \
+        --data-file data/locomo10_smoke.json --sample-id conv-30 \
+        --out-file outputs/conv30_official_mem0_qa.json \
+        --top-k 10 --max-qa 5 --qa-sleep 3
+
+    # Or: Gemini (only works if your project actually has free-tier quota)
     export GEMINI_API_KEY=...
     python scripts/run_official_mem0_eval.py \
-        --data-file data/locomo10_smoke.json \
-        --sample-id conv-30 \
+        --llm-provider gemini --llm-model gemini-2.0-flash \
+        --data-file data/locomo10_smoke.json --sample-id conv-30 \
         --out-file outputs/conv30_official_mem0_qa.json \
-        --top-k 10 \
-        --max-qa 5 --qa-sleep 10
+        --top-k 10 --max-qa 5 --qa-sleep 10
 """
 
 import sys
@@ -75,47 +83,39 @@ def get_session_nums(conv):
     return sorted(set(nums))
 
 
-def build_memory(api_key, llm_model, embed_provider, embed_model, embed_dims, collection):
-    """Construct an official mem0.Memory:
-       - LLM: Gemini (configurable model)
-       - Embedder: huggingface (default; no API, avoids Gemini embedContent 404)
-                   OR gemini (only if explicitly chosen)
-       - Vector store: qdrant in-memory
-    """
+def build_memory(llm_provider, llm_api_key, llm_model,
+                 embed_provider, embed_api_key, embed_model, embed_dims,
+                 collection):
+    """Construct an official mem0.Memory."""
     from mem0 import Memory
 
+    if llm_provider == 'gemini':
+        llm_cfg = {"provider": "gemini",
+                   "config": {"model": llm_model, "api_key": llm_api_key,
+                              "temperature": 0.0, "max_tokens": 2000}}
+    elif llm_provider == 'groq':
+        llm_cfg = {"provider": "groq",
+                   "config": {"model": llm_model, "api_key": llm_api_key,
+                              "temperature": 0.0, "max_tokens": 2000}}
+    else:
+        raise ValueError('Unsupported --llm-provider: %s' % llm_provider)
+
     if embed_provider == 'huggingface':
-        embedder_cfg = {
-            "provider": "huggingface",
-            "config": {"model": embed_model},
-        }
+        embedder_cfg = {"provider": "huggingface",
+                        "config": {"model": embed_model}}
     elif embed_provider == 'gemini':
-        embedder_cfg = {
-            "provider": "gemini",
-            "config": {"model": embed_model, "api_key": api_key},
-        }
+        embedder_cfg = {"provider": "gemini",
+                        "config": {"model": embed_model, "api_key": embed_api_key}}
     else:
         raise ValueError('Unsupported --embed-provider: %s' % embed_provider)
 
     config = {
-        "llm": {
-            "provider": "gemini",
-            "config": {
-                "model": llm_model,
-                "api_key": api_key,
-                "temperature": 0.0,
-                "max_tokens": 2000,
-            },
-        },
-        "embedder": embedder_cfg,
-        "vector_store": {
-            "provider": "qdrant",
-            "config": {
-                "collection_name": collection,
-                "embedding_model_dims": embed_dims,
-                "on_disk": False,
-            },
-        },
+        "llm":          llm_cfg,
+        "embedder":     embedder_cfg,
+        "vector_store": {"provider": "qdrant",
+                         "config": {"collection_name": collection,
+                                    "embedding_model_dims": embed_dims,
+                                    "on_disk": False}},
     }
     return Memory.from_config(config)
 
@@ -181,6 +181,53 @@ def _is_quota_error(e):
     return any(t in s for t in _QUOTA_TOKENS)
 
 
+def groq_generate(api_key, model_name, prompt, max_output_tokens=80, max_retries=6):
+    """Robust Groq call with backoff. Free tier is generous; quota errors are rare."""
+    from groq import Groq
+    client = Groq(api_key=api_key)
+    delays = [3, 6, 12, 24, 48, 90]
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=max_output_tokens,
+            )
+            return (resp.choices[0].message.content or '').strip()
+        except Exception as e:
+            last_err = e
+            quota = _is_quota_error(e)
+            wait = delays[min(attempt, 5)] if quota else min(2 ** attempt, 30)
+            print('  groq retry %d/%d in %ds (%s: %s)' %
+                  (attempt + 1, max_retries, wait, type(e).__name__, str(e)[:120]))
+            time.sleep(wait)
+    raise last_err
+
+
+def llm_generate(provider, api_key, model_name, prompt, max_output_tokens=80, max_retries=6):
+    if provider == 'gemini':
+        return gemini_generate(api_key, model_name, prompt, max_output_tokens, max_retries)
+    if provider == 'groq':
+        return groq_generate(api_key, model_name, prompt, max_output_tokens, max_retries)
+    raise ValueError('Unsupported --llm-provider: %s' % provider)
+
+
+def probe_llm(provider, api_key, model_name):
+    """One-shot probe to detect quota=0 / bad key / bad model BEFORE ingest."""
+    print('preflight: probing LLM (%s/%s)...' % (provider, model_name))
+    try:
+        ans = llm_generate(provider, api_key, model_name,
+                           'Reply with the single digit 1.',
+                           max_output_tokens=8, max_retries=1)
+        print('  LLM probe ok: %r' % (ans[:40] if ans else ''))
+        return True
+    except Exception as e:
+        print('  LLM probe FAILED: %s: %s' % (type(e).__name__, str(e)[:300]))
+        return False
+
+
 def gemini_generate(api_key, model_name, prompt, max_output_tokens=80, max_retries=6):
     """Robust Gemini call with exponential backoff on 429 / quota errors."""
     import google.generativeai as genai
@@ -215,8 +262,10 @@ def parse_args():
     ap.add_argument('--sample-id', default='conv-30')
     ap.add_argument('--out-file',  default='outputs/conv30_official_mem0_qa.json')
     ap.add_argument('--top-k', type=int, default=10)
-    ap.add_argument('--llm-model', default='gemini-1.5-flash',
-                    help='gemini-1.5-flash has higher free-tier quota than 2.0-flash.')
+    ap.add_argument('--llm-provider', default='groq', choices=['groq', 'gemini'],
+                    help='Groq free tier (30 RPM, 1000 RPD) is the recommended path.')
+    ap.add_argument('--llm-model', default='llama-3.3-70b-versatile',
+                    help='Default suits --llm-provider groq. For gemini, try gemini-2.0-flash.')
     ap.add_argument('--embed-provider', default='huggingface',
                     choices=['huggingface', 'gemini'],
                     help='Local sentence-transformers by default; avoids Gemini embedContent issues.')
@@ -238,19 +287,35 @@ def parse_args():
 
 def main():
     args = parse_args()
-    api_key = os.environ.get('GEMINI_API_KEY')
-    if not api_key:
-        raise SystemExit('Set GEMINI_API_KEY in the environment.')
+
+    if args.llm_provider == 'groq':
+        llm_api_key = os.environ.get('GROQ_API_KEY')
+        if not llm_api_key:
+            raise SystemExit('Set GROQ_API_KEY in the environment (https://console.groq.com/keys).')
+    else:
+        llm_api_key = os.environ.get('GEMINI_API_KEY')
+        if not llm_api_key:
+            raise SystemExit('Set GEMINI_API_KEY in the environment.')
+
+    embed_api_key = os.environ.get('GEMINI_API_KEY') if args.embed_provider == 'gemini' else None
 
     samples = json.load(open(args.data_file, 'r', encoding='utf-8'))
     sample = next((s for s in samples if s.get('sample_id') == args.sample_id), None)
     if sample is None:
         raise SystemExit('sample_id=%s not found in %s' % (args.sample_id, args.data_file))
 
-    print('initializing mem0 (llm=%s, embed=%s/%s dims=%d)...' %
-          (args.llm_model, args.embed_provider, args.embed_model, args.embed_dims))
-    m = build_memory(api_key, args.llm_model, args.embed_provider,
-                     args.embed_model, args.embed_dims, args.collection)
+    if not probe_llm(args.llm_provider, llm_api_key, args.llm_model):
+        raise SystemExit(
+            'Aborting: LLM not usable (likely quota=0, invalid key, or wrong model name). '
+            'For Gemini quota=0 errors, switch with --llm-provider groq --llm-model llama-3.3-70b-versatile.'
+        )
+
+    print('initializing mem0 (llm=%s/%s, embed=%s/%s dims=%d)...' %
+          (args.llm_provider, args.llm_model,
+           args.embed_provider, args.embed_model, args.embed_dims))
+    m = build_memory(args.llm_provider, llm_api_key, args.llm_model,
+                     args.embed_provider, embed_api_key, args.embed_model, args.embed_dims,
+                     args.collection)
 
     if not args.skip_ingest:
         print('ingesting sample=%s into Mem0...' % args.sample_id)
@@ -301,7 +366,7 @@ def main():
         prompt = ANSWER_PROMPT.format(memories=mem_text, question=question)
 
         try:
-            answer = gemini_generate(api_key, args.llm_model, prompt)
+            answer = llm_generate(args.llm_provider, llm_api_key, args.llm_model, prompt)
         except Exception as e:
             print('  generate error qa[%d]: %s' % (i, e))
             answer = ''
