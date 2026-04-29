@@ -129,15 +129,38 @@ def prepare_for_rag(args, data):
         # Graph-extended Mem0 memory: same embeddings/contexts as Mem0-lite plus
         # a networkx.MultiDiGraph over (subject, relation, object) triples.
         # Built offline by scripts/build_graph_memories.py.
-        gm_pkl = os.path.join(args.emb_dir, '%s_graph_mem0_%s.pkl' % (dataset_prefix, data['sample_id']))
-        if not os.path.exists(gm_pkl):
+        # Resolution order:
+        #   1) {emb_dir}/{prefix}_graph_mem0_{sample}.pkl  (preferred)
+        #   2) ./{prefix}_graph_mem0_{sample}.pkl          (cwd fallback)
+        gm_filename = '%s_graph_mem0_%s.pkl' % (dataset_prefix, data['sample_id'])
+        gm_pkl_primary  = os.path.join(args.emb_dir, gm_filename) if args.emb_dir else gm_filename
+        gm_pkl_fallback = gm_filename
+        if os.path.exists(gm_pkl_primary):
+            gm_pkl = gm_pkl_primary
+        elif os.path.exists(gm_pkl_fallback):
+            gm_pkl = gm_pkl_fallback
+        else:
             raise FileNotFoundError(
-                "Graph Mem0 memories pkl not found: %s\n"
+                "Graph Mem0 memories pkl not found.\n"
+                "  tried: %s\n"
+                "  tried: %s\n"
                 "Build it first with: python scripts/build_graph_memories.py "
-                "--data-file %s --sample-id %s --model qwen2.5-7b-instruct --use-4bit"
-                % (gm_pkl, args.data_file, data['sample_id'])
+                "--data-file %s --sample-id %s --emb-dir %s "
+                "--model qwen2.5-7b-instruct --use-4bit"
+                % (gm_pkl_primary, gm_pkl_fallback, args.data_file,
+                   data['sample_id'], args.emb_dir or 'dragon_emb')
             )
+        print('graph_mem0: loading graph pkl from %s' % gm_pkl)
         database = pickle.load(open(gm_pkl, 'rb'))
+
+        graph = database.get('graph')
+        n_nodes = graph.number_of_nodes() if graph is not None else 0
+        n_edges = graph.number_of_edges() if graph is not None else 0
+        n_facts = len(database.get('context', []))
+        print('graph_mem0: facts=%d, graph nodes=%d, graph edges=%d, '
+              'graph_expand_k=%s'
+              % (n_facts, n_nodes, n_edges,
+                 getattr(args, 'graph_expand_k', None)))
 
 
     elif args.rag_mode == 'observation':

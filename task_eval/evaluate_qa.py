@@ -26,7 +26,7 @@ def parse_args():
     parser.add_argument('--use-4bit', action="store_true")
     parser.add_argument('--batch-size', default=1, type=int)
     parser.add_argument('--rag-mode', type=str, default="")
-    parser.add_argument('--emb-dir', type=str, default="")
+    parser.add_argument('--emb-dir', type=str, default="dragon_emb")
     parser.add_argument('--top-k', type=int, default=5)
     parser.add_argument('--retriever', type=str, default="contriever")
     parser.add_argument('--overwrite', action="store_true")
@@ -75,6 +75,14 @@ def main():
     samples = json.load(open(args.data_file))
     prediction_key = "%s_prediction" % args.model if not args.use_rag else "%s_%s_top_%s_prediction" % (args.model, args.rag_mode, args.top_k)
     model_key = "%s" % args.model if not args.use_rag else "%s_%s_top_%s" % (args.model, args.rag_mode, args.top_k)
+
+    # Auto-create the output directory so callers can pass nested paths like
+    # outputs/qwen_conv30_graph_mem0_expand5_top10_qa.json without pre-creating
+    # the folder. Existing baselines are unaffected when outputs/ already exists.
+    out_dir = os.path.dirname(args.out_file)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     # load the output file if it exists to check for overwriting
     if os.path.exists(args.out_file):
         out_samples = {d['sample_id']: d for d in json.load(open(args.out_file))}
