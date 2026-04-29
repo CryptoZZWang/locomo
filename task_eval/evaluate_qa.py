@@ -30,6 +30,13 @@ def parse_args():
     parser.add_argument('--top-k', type=int, default=5)
     parser.add_argument('--retriever', type=str, default="contriever")
     parser.add_argument('--overwrite', action="store_true")
+    parser.add_argument('--max-qa', type=int, default=None,
+                        help='Smoke-test cap on the number of QAs per sample. '
+                             'When set, aggregate stats are skipped to avoid '
+                             'polluting the *_stats.json with partial coverage.')
+    parser.add_argument('--graph-expand-k', type=int, default=20,
+                        help='Max 1-hop neighbour triples appended to the '
+                             'context when --rag-mode graph_mem0 is used.')
     args = parser.parse_args()
     return args
 
@@ -83,6 +90,13 @@ def main():
         else:
             out_data['qa'] = data['qa'].copy()
 
+        # --max-qa is opt-in; default behaviour for full runs is unchanged.
+        if args.max_qa is not None and args.max_qa > 0:
+            data['qa']     = data['qa'][:args.max_qa]
+            out_data['qa'] = out_data['qa'][:args.max_qa]
+            print('--max-qa=%d: limiting sample %s to first %d QAs (smoke test)'
+                  % (args.max_qa, data['sample_id'], args.max_qa))
+
         if 'gpt' in args.model:
             # get answers for each sample
             answers = get_gpt_answers(data, out_data, prediction_key, args)
@@ -112,9 +126,12 @@ def main():
     with open(args.out_file, 'w') as f:
         json.dump(list(out_samples.values()), f, indent=2)
 
-    
-    analyze_aggr_acc(args.data_file, args.out_file, args.out_file.replace('.json', '_stats.json'),
-                model_key, model_key + '_f1', rag=args.use_rag)
+    if args.max_qa is not None and args.max_qa > 0:
+        print('--max-qa was set; skipping aggregate stats. '
+              'Inspect predictions in %s manually.' % args.out_file)
+    else:
+        analyze_aggr_acc(args.data_file, args.out_file, args.out_file.replace('.json', '_stats.json'),
+                    model_key, model_key + '_f1', rag=args.use_rag)
     # encoder=tiktoken.encoding_for_model(args.model))
 
 

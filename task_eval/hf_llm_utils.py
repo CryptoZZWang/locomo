@@ -262,7 +262,11 @@ def get_hf_answers(in_data, out_data, args, pipeline, model_name):
     # do not collide with full-context runs in the same output JSON.
     if args.use_rag:
         prediction_key = "%s_%s_top_%s_prediction" % (args.model, args.rag_mode, args.top_k)
-        from task_eval.gpt_utils import prepare_for_rag, get_rag_context
+        from task_eval.gpt_utils import (
+            prepare_for_rag,
+            get_rag_context,
+            get_graph_rag_context,
+        )
         context_database, query_vectors = prepare_for_rag(args, in_data)
     else:
         prediction_key = "%s_prediction" % args.model
@@ -316,9 +320,14 @@ def get_hf_answers(in_data, out_data, args, pipeline, model_name):
         if args.batch_size == 1:
 
             if args.use_rag:
-                query_conv, context_ids = get_rag_context(
-                    context_database, query_vectors[include_idxs][0], args
-                )
+                if args.rag_mode == 'graph_mem0':
+                    query_conv, context_ids = get_graph_rag_context(
+                        context_database, query_vectors[include_idxs][0], args
+                    )
+                else:
+                    query_conv, context_ids = get_rag_context(
+                        context_database, query_vectors[include_idxs][0], args
+                    )
                 answer = run_hf_rag(pipeline, questions[0], query_conv, encoding, args)
             elif 'mistral' in model_name.lower():
                 answer = run_mistral(pipeline, questions[0], in_data, encoding, args)

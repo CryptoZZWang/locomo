@@ -124,6 +124,22 @@ def prepare_for_rag(args, data):
         database = pickle.load(open(mem0_pkl, 'rb'))
 
 
+    elif args.rag_mode == 'graph_mem0':
+
+        # Graph-extended Mem0 memory: same embeddings/contexts as Mem0-lite plus
+        # a networkx.MultiDiGraph over (subject, relation, object) triples.
+        # Built offline by scripts/build_graph_memories.py.
+        gm_pkl = os.path.join(args.emb_dir, '%s_graph_mem0_%s.pkl' % (dataset_prefix, data['sample_id']))
+        if not os.path.exists(gm_pkl):
+            raise FileNotFoundError(
+                "Graph Mem0 memories pkl not found: %s\n"
+                "Build it first with: python scripts/build_graph_memories.py "
+                "--data-file %s --sample-id %s --model qwen2.5-7b-instruct --use-4bit"
+                % (gm_pkl, args.data_file, data['sample_id'])
+            )
+        database = pickle.load(open(gm_pkl, 'rb'))
+
+
     elif args.rag_mode == 'observation':
 
         # Auto-build observation embeddings from data['observation'] if the pkl
@@ -217,6 +233,100 @@ def get_rag_context(context_database, query_vector, args):
     else:
         query_context = '\n\n'.join([date_time + ': ' + context for date_time, context in zip(sorted_date_times, sorted_context)])
 
+    return query_context, sorted_context_ids
+
+
+def _append_dia_id(target_list, seen, cid):
+    if isinstance(cid, str) and ',' in cid:
+        for c in cid.split(','):
+            c = c.strip()
+            if c and c not in seen:
+                seen.add(c)
+                target_list.append(c)
+    elif isinstance(cid, list):
+        for c in cid:
+            if c and c not in seen:
+                seen.add(c)
+                target_list.append(c)
+    elif cid and cid not in seen:
+        seen.add(cid)
+        target_list.append(cid)
+
+
+def get_graph_rag_context(context_database, query_vector, args):
+    """Graph-enhanced RAG context for rag_mode='graph_mem0'.
+
+    1. cosine top-k over memory facts (same as get_rag_context),
+    2. collect entities mentioned in those top-k facts,
+    3. expand 1-hop neighbours in the memory graph, capped at
+       args.graph_expand_k, excluding triples whose source memory is
+       already in the top-k,
+    4. emit two prompt blocks: 'Top memories:' and 'Related facts:'.
+
+    Returns (context_string, dia_ids) so the existing recall metric still
+    works on the union of evidence behind both blocks.
+    """
+    embeddings = context_database['embeddings']
+    contexts   = context_database['context']
+    date_times = context_database['date_time']
+    dia_ids    = context_database['dia_id']
+    graph      = context_database.get('graph')
+    mem_to_entities = context_database.get('mem_to_entities', [])
+
+    scores = np.dot(query_vector, embeddings.T)
+    sorted_outputs = np.argsort(scores)[::-1]
+    top_idx = [int(i) for i in sorted_outputs[:args.top_k]]
+    src_set = set(top_idx)
+
+    seen_dia = set()
+    sorted_context_ids = []
+    top_lines = []
+    for idx in top_idx:
+        top_lines.append('%s: %s' % (date_times[idx], contexts[idx]))
+        _append_dia_id(sorted_context_ids, seen_dia, dia_ids[idx])
+
+    triple_lines = []
+    max_extra = int(getattr(args, 'graph_expand_k', 20) or 0)
+    if graph is not None and mem_to_entities and max_extra > 0:
+        seen_triple = set()
+        for idx in top_idx:
+            if len(triple_lines) >= max_extra:
+                break
+            ents = mem_to_entities[idx] if idx < len(mem_to_entities) else []
+            for ent in ents:
+                if len(triple_lines) >= max_extra:
+                    break
+                if ent not in graph:
+                    continue
+                edges = []
+                edges.extend(list(graph.in_edges(ent, keys=True, data=True)))
+                edges.extend(list(graph.out_edges(ent, keys=True, data=True)))
+                for u, v, _k, d in edges:
+                    mi = d.get('mem_idx')
+                    if mi in src_set:
+                        continue
+                    key = (u, d.get('relation', ''), v, mi)
+                    if key in seen_triple:
+                        continue
+                    seen_triple.add(key)
+                    u_disp = graph.nodes[u].get('display', u) if u in graph else u
+                    v_disp = graph.nodes[v].get('display', v) if v in graph else v
+                    rel = d.get('relation', '')
+                    dt = d.get('date_time', '')
+                    triple_lines.append(
+                        '- %s --[%s]--> %s (%s)' % (u_disp, rel, v_disp, dt)
+                    )
+                    _append_dia_id(sorted_context_ids, seen_dia, d.get('dia_id', ''))
+                    if len(triple_lines) >= max_extra:
+                        break
+
+    parts = ['Top memories:']
+    parts.extend(top_lines)
+    if triple_lines:
+        parts.append('')
+        parts.append('Related facts (1-hop graph neighbours):')
+        parts.extend(triple_lines)
+    query_context = '\n'.join(parts)
     return query_context, sorted_context_ids
 
 
